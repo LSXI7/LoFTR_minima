@@ -1,23 +1,40 @@
-import math
 import argparse
+import math
+import os
 import pprint
 from distutils.util import strtobool
 from pathlib import Path
-from loguru import logger as loguru_logger
 
+import matplotlib
 import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_only
+from loguru import logger as loguru_logger
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.plugins import DDPPlugin
-
+from pytorch_lightning.utilities import rank_zero_only
 from src.config.default import get_cfg_defaults
-from src.utils.misc import get_rank_zero_only_logger, setup_gpus
-from src.utils.profiler import build_profiler
 from src.lightning.data import MultiSceneDataModule
 from src.lightning.lightning_loftr import PL_LoFTR
+from src.utils.misc import get_rank_zero_only_logger, setup_gpus
+from src.utils.profiler import build_profiler
+
+matplotlib.use('Agg')
 
 loguru_logger = get_rank_zero_only_logger(loguru_logger)
+
+
+class SaveCheckpointEveryNBatch(Callback):
+    def __init__(self, save_dir, every_n_batch=100, prefix="batch"):
+        super().__init__()
+        self.save_dir = save_dir
+        self.every_n_batch = every_n_batch
+        self.prefix = prefix
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+        if trainer.is_global_zero and (batch_idx + 1) % self.every_n_batch == 0:
+            filename = os.path.join(self.save_dir, f"{self.prefix}_epoch{trainer.current_epoch}_batch{batch_idx}.ckpt")
+            trainer.save_checkpoint(filename)
+            print(f"Checkpoint saved at {filename}")
 
 
 def parse_args():
@@ -49,6 +66,18 @@ def parse_args():
     parser.add_argument(
         '--parallel_load_data', action='store_true',
         help='load datasets in with multiple processes.')
+    parser.add_argument(
+        '--save_top_k', type=int, default=10,
+        help='save top k checkpoints based on the monitored metric')
+    parser.add_argument(
+        '--lr_scale', type=float, default=1.0,
+        help='scale the learning rate for fine-tuning')
+    parser.add_argument(
+        '--modality_list', nargs='+', default=['visible'],
+        help='List of modalities')
+    parser.add_argument(
+        '--save_dir', type=str, default=None,
+        help='save directory')
 
     parser = pl.Trainer.add_argparse_args(parser)
     return parser.parse_args()
@@ -66,7 +95,8 @@ def main():
     pl.seed_everything(config.TRAINER.SEED)  # reproducibility
     # TODO: Use different seeds for each dataloader workers
     # This is needed for data augmentation
-    
+    # print('modality_list:', args.modality_list)
+
     # scale lr and warmup-step automatically
     args.gpus = _n_gpus = setup_gpus(args.gpus)
     config.TRAINER.WORLD_SIZE = _n_gpus * args.num_nodes
@@ -74,35 +104,44 @@ def main():
     _scaling = config.TRAINER.TRUE_BATCH_SIZE / config.TRAINER.CANONICAL_BS
     config.TRAINER.SCALING = _scaling
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
+    lr_scale = args.lr_scale
+    config.TRAINER.TRUE_LR = config.TRAINER.TRUE_LR * lr_scale  # for fine-tuning
     config.TRAINER.WARMUP_STEP = math.floor(config.TRAINER.WARMUP_STEP / _scaling)
-    
+
     # lightning module
     profiler = build_profiler(args.profiler_name)
     model = PL_LoFTR(config, pretrained_ckpt=args.ckpt_path, profiler=profiler)
     loguru_logger.info(f"LoFTR LightningModule initialized!")
-    
+
     # lightning data
     data_module = MultiSceneDataModule(args, config)
     loguru_logger.info(f"LoFTR DataModule initialized!")
-    
+
     # TensorBoard Logger
-    logger = TensorBoardLogger(save_dir='logs/tb_logs', name=args.exp_name, default_hp_metric=False)
+    save_dir = Path(args.save_dir)
+    logger = TensorBoardLogger(save_dir=f'{save_dir}/logs/tb_logs', name=args.exp_name, default_hp_metric=False)
     ckpt_dir = Path(logger.log_dir) / 'checkpoints'
-    
+    save_config_dir = Path(logger.log_dir) / 'configs'
+    save_config_dir.mkdir(parents=True, exist_ok=True)
+    with open(save_config_dir / 'config.yaml', 'w') as f:
+        f.write(config.dump())
+
     # Callbacks
     # TODO: update ModelCheckpoint to monitor multiple metrics
-    ckpt_callback = ModelCheckpoint(monitor='auc@10', verbose=True, save_top_k=5, mode='max',
-                                    save_last=True,
+    batch_ckpt_callback = SaveCheckpointEveryNBatch(save_dir=str(ckpt_dir), every_n_batch=1000)
+    ckpt_callback = ModelCheckpoint(monitor='auc@10', verbose=True, save_top_k=args.save_top_k, mode='max',
+                                    save_last=False,
                                     dirpath=str(ckpt_dir),
                                     filename='{epoch}-{auc@5:.3f}-{auc@10:.3f}-{auc@20:.3f}')
     lr_monitor = LearningRateMonitor(logging_interval='step')
     callbacks = [lr_monitor]
     if not args.disable_ckpt:
         callbacks.append(ckpt_callback)
-    
+
     # Lightning Trainer
     trainer = pl.Trainer.from_argparse_args(
         args,
+        resume_from_checkpoint=args.resume_from_checkpoint,
         plugins=DDPPlugin(find_unused_parameters=False,
                           num_nodes=args.num_nodes,
                           sync_batchnorm=config.TRAINER.WORLD_SIZE > 0),

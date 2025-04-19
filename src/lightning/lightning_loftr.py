@@ -144,15 +144,15 @@ class PL_LoFTR(pl.LightningModule):
         
         ret_dict, _ = self._compute_metrics(batch)
         
-        val_plot_interval = max(self.trainer.num_val_batches[0] // self.n_vals_plot, 1)
-        figures = {self.config.TRAINER.PLOT_MODE: []}
-        if batch_idx % val_plot_interval == 0:
-            figures = make_matching_figures(batch, self.config, mode=self.config.TRAINER.PLOT_MODE)
+        # val_plot_interval = max(self.trainer.num_val_batches[0] // self.n_vals_plot, 1)
+        # figures = {self.config.TRAINER.PLOT_MODE: []}
+        # if batch_idx % val_plot_interval == 0:
+        #     figures = make_matching_figures(batch, self.config, mode=self.config.TRAINER.PLOT_MODE)
 
         return {
             **ret_dict,
             'loss_scalars': batch['loss_scalars'],
-            'figures': figures,
+            # 'figures': figures,
         }
         
     def validation_epoch_end(self, outputs):
@@ -179,8 +179,8 @@ class PL_LoFTR(pl.LightningModule):
                 multi_val_metrics[f'auc@{thr}'].append(val_metrics_4tb[f'auc@{thr}'])
             
             # 3. figures
-            _figures = [o['figures'] for o in outputs]
-            figures = {k: flattenList(gather(flattenList([_me[k] for _me in _figures]))) for k in _figures[0]}
+            # _figures = [o['figures'] for o in outputs]
+            # figures = {k: flattenList(gather(flattenList([_me[k] for _me in _figures]))) for k in _figures[0]}
 
             # tensorboard records only on rank 0
             if self.trainer.global_rank == 0:
@@ -191,12 +191,12 @@ class PL_LoFTR(pl.LightningModule):
                 for k, v in val_metrics_4tb.items():
                     self.logger.experiment.add_scalar(f"metrics_{valset_idx}/{k}", v, global_step=cur_epoch)
                 
-                for k, v in figures.items():
-                    if self.trainer.global_rank == 0:
-                        for plot_idx, fig in enumerate(v):
-                            self.logger.experiment.add_figure(
-                                f'val_match_{valset_idx}/{k}/pair-{plot_idx}', fig, cur_epoch, close=True)
-            plt.close('all')
+                # for k, v in figures.items():
+                #     if self.trainer.global_rank == 0:
+                #         for plot_idx, fig in enumerate(v):
+                #             self.logger.experiment.add_figure(
+                #                 f'val_match_{valset_idx}/{k}/pair-{plot_idx}', fig, cur_epoch, close=True)
+            # plt.close('all')
 
         for thr in [5, 10, 20]:
             # log on all ranks for ModelCheckpoint callback to work properly

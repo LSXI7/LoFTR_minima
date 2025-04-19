@@ -1,14 +1,19 @@
-import os
 import math
+import os
 from collections import abc
-from loguru import logger
-from torch.utils.data.dataset import Dataset
-from tqdm import tqdm
 from os import path as osp
 from pathlib import Path
-from joblib import Parallel, delayed
 
 import pytorch_lightning as pl
+from joblib import Parallel, delayed
+from loguru import logger
+from src.datasets.megadepth import MegaDepthDataset
+from src.datasets.sampler import RandomConcatSampler
+from src.datasets.scannet import ScanNetDataset
+from src.utils import comm
+from src.utils.augment import build_augmentor
+from src.utils.dataloader import get_local_split
+from src.utils.misc import tqdm_joblib
 from torch import distributed as dist
 from torch.utils.data import (
     Dataset,
@@ -18,14 +23,8 @@ from torch.utils.data import (
     RandomSampler,
     dataloader
 )
-
-from src.utils.augment import build_augmentor
-from src.utils.dataloader import get_local_split
-from src.utils.misc import tqdm_joblib
-from src.utils import comm
-from src.datasets.megadepth import MegaDepthDataset
-from src.datasets.scannet import ScanNetDataset
-from src.datasets.sampler import RandomConcatSampler
+from torch.utils.data.dataset import Dataset
+from tqdm import tqdm
 
 
 class MultiSceneDataModule(pl.LightningDataModule):
@@ -33,6 +32,7 @@ class MultiSceneDataModule(pl.LightningDataModule):
     For distributed training, each training process is assgined
     only a part of the training scenes to reduce memory overhead.
     """
+
     def __init__(self, args, config):
         super().__init__()
 
@@ -57,6 +57,7 @@ class MultiSceneDataModule(pl.LightningDataModule):
         self.test_npz_root = config.DATASET.TEST_NPZ_ROOT
         self.test_list_path = config.DATASET.TEST_LIST_PATH
         self.test_intrinsic_path = config.DATASET.TEST_INTRINSIC_PATH
+        self.modality_list = args.modality_list  # 'rgbd', 'rgb', 'depth'
 
         # 2. dataset config
         # general options
@@ -66,8 +67,8 @@ class MultiSceneDataModule(pl.LightningDataModule):
 
         # MegaDepth options
         self.mgdpt_img_resize = config.DATASET.MGDPT_IMG_RESIZE  # 840
-        self.mgdpt_img_pad = config.DATASET.MGDPT_IMG_PAD   # True
-        self.mgdpt_depth_pad = config.DATASET.MGDPT_DEPTH_PAD   # True
+        self.mgdpt_img_pad = config.DATASET.MGDPT_IMG_PAD  # True
+        self.mgdpt_depth_pad = config.DATASET.MGDPT_DEPTH_PAD  # True
         self.mgdpt_df = config.DATASET.MGDPT_DF  # 8
         self.coarse_scale = 1 / config.LOFTR.RESOLUTION[0]  # 0.125. for training loftr.
 
@@ -89,14 +90,14 @@ class MultiSceneDataModule(pl.LightningDataModule):
             'num_workers': args.num_workers,
             'pin_memory': True
         }
-        
+
         # 4. sampler
         self.data_sampler = config.TRAINER.DATA_SAMPLER
         self.n_samples_per_subset = config.TRAINER.N_SAMPLES_PER_SUBSET
         self.subset_replacement = config.TRAINER.SB_SUBSET_SAMPLE_REPLACEMENT
         self.shuffle = config.TRAINER.SB_SUBSET_SHUFFLE
         self.repeat = config.TRAINER.SB_REPEAT
-        
+
         # (optional) RandomSampler for debugging
 
         # misc configurations
@@ -129,7 +130,8 @@ class MultiSceneDataModule(pl.LightningDataModule):
                 self.train_intrinsic_path,
                 mode='train',
                 min_overlap_score=self.min_overlap_score_train,
-                pose_dir=self.train_pose_root)
+                pose_dir=self.train_pose_root,
+                modality_list=self.modality_list)
             # setup multiple (optional) validation subsets
             if isinstance(self.val_list_path, (list, tuple)):
                 self.val_dataset = []
@@ -143,7 +145,9 @@ class MultiSceneDataModule(pl.LightningDataModule):
                         self.val_intrinsic_path,
                         mode='val',
                         min_overlap_score=self.min_overlap_score_test,
-                        pose_dir=self.val_pose_root))
+                        pose_dir=self.val_pose_root,
+                        modality_list=self.modality_list
+                    ))
             else:
                 self.val_dataset = self._setup_dataset(
                     self.val_data_root,
@@ -152,7 +156,9 @@ class MultiSceneDataModule(pl.LightningDataModule):
                     self.val_intrinsic_path,
                     mode='val',
                     min_overlap_score=self.min_overlap_score_test,
-                    pose_dir=self.val_pose_root)
+                    pose_dir=self.val_pose_root,
+                    modality_list=self.modality_list
+                )
             logger.info(f'[rank:{self.rank}] Train & Val Dataset loaded!')
         else:  # stage == 'test
             self.test_dataset = self._setup_dataset(
@@ -162,7 +168,8 @@ class MultiSceneDataModule(pl.LightningDataModule):
                 self.test_intrinsic_path,
                 mode='test',
                 min_overlap_score=self.min_overlap_score_test,
-                pose_dir=self.test_pose_root)
+                pose_dir=self.test_pose_root,
+                modality_list=self.modality_list)
             logger.info(f'[rank:{self.rank}]: Test Dataset loaded!')
 
     def _setup_dataset(self,
@@ -172,8 +179,11 @@ class MultiSceneDataModule(pl.LightningDataModule):
                        intri_path,
                        mode='train',
                        min_overlap_score=0.,
-                       pose_dir=None):
+                       pose_dir=None,
+                       modality_list=None):
         """ Setup train / val / test set"""
+        if modality_list is None:
+            modality_list = ['visible']
         with open(scene_list_path, 'r') as f:
             npz_names = [name.split()[0] for name in f.readlines()]
 
@@ -182,22 +192,24 @@ class MultiSceneDataModule(pl.LightningDataModule):
         else:
             local_npz_names = npz_names
         logger.info(f'[rank {self.rank}]: {len(local_npz_names)} scene(s) assigned.')
-        
+
         dataset_builder = self._build_concat_dataset_parallel \
-                            if self.parallel_load_data \
-                            else self._build_concat_dataset
+            if self.parallel_load_data \
+            else self._build_concat_dataset
         return dataset_builder(data_root, local_npz_names, split_npz_root, intri_path,
-                                mode=mode, min_overlap_score=min_overlap_score, pose_dir=pose_dir)
+                               mode=mode, min_overlap_score=min_overlap_score, pose_dir=pose_dir,
+                               modality_list=modality_list)
 
     def _build_concat_dataset(
-        self,
-        data_root,
-        npz_names,
-        npz_dir,
-        intrinsic_path,
-        mode,
-        min_overlap_score=0.,
-        pose_dir=None
+            self,
+            data_root,
+            npz_names,
+            npz_dir,
+            intrinsic_path,
+            mode,
+            min_overlap_score=0.,
+            pose_dir=None,
+            modality_list=None,
     ):
         datasets = []
         augment_fn = self.augment_fn if mode == 'train' else None
@@ -217,7 +229,8 @@ class MultiSceneDataModule(pl.LightningDataModule):
                                    mode=mode,
                                    min_overlap_score=min_overlap_score,
                                    augment_fn=augment_fn,
-                                   pose_dir=pose_dir))
+                                   pose_dir=pose_dir,
+                                   modality_list=modality_list))
             elif data_source == 'MegaDepth':
                 datasets.append(
                     MegaDepthDataset(data_root,
@@ -229,20 +242,21 @@ class MultiSceneDataModule(pl.LightningDataModule):
                                      img_padding=self.mgdpt_img_pad,
                                      depth_padding=self.mgdpt_depth_pad,
                                      augment_fn=augment_fn,
-                                     coarse_scale=self.coarse_scale))
+                                     coarse_scale=self.coarse_scale,
+                                     modality_list=modality_list))
             else:
                 raise NotImplementedError()
         return ConcatDataset(datasets)
-    
+
     def _build_concat_dataset_parallel(
-        self,
-        data_root,
-        npz_names,
-        npz_dir,
-        intrinsic_path,
-        mode,
-        min_overlap_score=0.,
-        pose_dir=None,
+            self,
+            data_root,
+            npz_names,
+            npz_dir,
+            intrinsic_path,
+            mode,
+            min_overlap_score=0.,
+            pose_dir=None,
     ):
         augment_fn = self.augment_fn if mode == 'train' else None
         data_source = self.trainval_data_source if mode in ['train', 'val'] else self.test_data_source
@@ -286,7 +300,8 @@ class MultiSceneDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         """ Build training dataloader for ScanNet / MegaDepth. """
         assert self.data_sampler in ['scene_balance']
-        logger.info(f'[rank:{self.rank}/{self.world_size}]: Train Sampler and DataLoader re-init (should not re-init between epochs!).')
+        logger.info(
+            f'[rank:{self.rank}/{self.world_size}]: Train Sampler and DataLoader re-init (should not re-init between epochs!).')
         if self.data_sampler == 'scene_balance':
             sampler = RandomConcatSampler(self.train_dataset,
                                           self.n_samples_per_subset,
@@ -296,7 +311,7 @@ class MultiSceneDataModule(pl.LightningDataModule):
             sampler = None
         dataloader = DataLoader(self.train_dataset, sampler=sampler, **self.train_loader_params)
         return dataloader
-    
+
     def val_dataloader(self):
         """ Build validation dataloader for ScanNet / MegaDepth. """
         logger.info(f'[rank:{self.rank}/{self.world_size}]: Val Sampler and DataLoader re-init.')
